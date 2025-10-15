@@ -601,6 +601,7 @@ EOF
     
     backup_if_exists "$MYSQL_SERVICE_FILE" "mysqld.service_existing"
     
+    # First, try to create a service file using mysqld_safe
     cat > "$MYSQL_SERVICE_FILE" << EOF
 [Unit]
 Description=MySQL Community Server
@@ -615,18 +616,48 @@ WantedBy=multi-user.target
 [Service]
 User=$MYSQL_USER
 Group=$MYSQL_GROUP
-Type=notify
+Type=forking
+PIDFile=$MYSQL_BASE_DIR/mysql.pid
 TimeoutSec=0
 PermissionsStartOnly=true
-ExecStartPre=/usr/local/mysql/bin/mysqld_safe_helper
-ExecStart=/usr/local/mysql/bin/mysqld --defaults-file=$MYSQL_CONFIG_FILE
+ExecStart=/usr/local/mysql/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --pid-file=$MYSQL_BASE_DIR/mysql.pid
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
 Restart=on-failure
 RestartPreventExitStatus=1
-Environment=MYSQLD_PARENT_PID=1
-LimitNOFILE=10000
-LimitNPROC=10000
+LimitNOFILE=65535
+LimitNPROC=65535
 PrivateTmp=false
 EOF
+
+    # Verify if mysqld_safe exists, if not create alternative service
+    if [[ ! -x "/usr/local/mysql/bin/mysqld_safe" ]]; then
+        log_warn "mysqld_safe not found, creating alternative service configuration..."
+        cat > "$MYSQL_SERVICE_FILE" << EOF
+[Unit]
+Description=MySQL Community Server
+Documentation=man:mysqld(8)
+After=network.target
+After=syslog.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+User=$MYSQL_USER
+Group=$MYSQL_GROUP
+Type=simple
+ExecStart=/usr/local/mysql/bin/mysqld --defaults-file=$MYSQL_CONFIG_FILE --user=$MYSQL_USER
+Restart=on-failure
+RestartPreventExitStatus=1
+LimitNOFILE=65535
+LimitNPROC=65535
+PrivateTmp=false
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=mysqld
+EOF
+    fi
 
     if [[ $? -eq 0 ]]; then
         log_success "MySQL systemd service file created successfully"
@@ -762,6 +793,124 @@ validate_installation() {
     log_success "MySQL installation validation completed successfully"
 }
 
+# Diagnostic function for troubleshooting
+diagnose_mysql_issues() {
+    echo "=========================================="
+    echo "MySQL Installation Diagnostic Report"
+    echo "=========================================="
+    echo "Generated at: $(date)"
+    echo
+    
+    echo "1. Service Status:"
+    systemctl status mysqld --no-pager || echo "MySQL service not found"
+    echo
+    
+    echo "2. Recent systemd logs:"
+    journalctl -u mysqld --since "30 minutes ago" --no-pager | tail -20
+    echo
+    
+    echo "3. MySQL Error Log:"
+    if [[ -f "$MYSQL_LOG_DIR/mysql.err" ]]; then
+        echo "Last 20 lines of $MYSQL_LOG_DIR/mysql.err:"
+        tail -20 "$MYSQL_LOG_DIR/mysql.err"
+    else
+        echo "MySQL error log not found at $MYSQL_LOG_DIR/mysql.err"
+        # Check alternative locations
+        for log_path in "/var/log/mysqld.log" "/var/log/mysql/error.log"; do
+            if [[ -f "$log_path" ]]; then
+                echo "Found alternative log at $log_path:"
+                tail -10 "$log_path"
+                break
+            fi
+        done
+    fi
+    echo
+    
+    echo "4. Directory Structure:"
+    echo "MySQL base directory: $MYSQL_BASE_DIR"
+    ls -la "$MYSQL_BASE_DIR" 2>/dev/null || echo "Base directory not found"
+    echo
+    
+    echo "Required directories:"
+    for dir in "$MYSQL_DATA_DIR" "$MYSQL_LOG_DIR" "$MYSQL_TMP_DIR" "$MYSQL_BINLOG_DIR"; do
+        if [[ -d "$dir" ]]; then
+            echo "✓ $dir ($(ls -ld "$dir" | awk '{print $1, $3, $4}'))"
+        else
+            echo "✗ $dir (missing)"
+        fi
+    done
+    echo
+    
+    echo "5. Configuration File:"
+    if [[ -f "$MYSQL_CONFIG_FILE" ]]; then
+        echo "Configuration file exists: $MYSQL_CONFIG_FILE"
+        echo "File permissions: $(ls -l "$MYSQL_CONFIG_FILE" | awk '{print $1, $3, $4}')"
+    else
+        echo "Configuration file missing: $MYSQL_CONFIG_FILE"
+    fi
+    echo
+    
+    echo "6. MySQL User and Permissions:"
+    if id "$MYSQL_USER" &>/dev/null; then
+        echo "MySQL user exists: $(id "$MYSQL_USER")"
+    else
+        echo "MySQL user not found: $MYSQL_USER"
+    fi
+    echo
+    
+    echo "7. Process Information:"
+    ps aux | grep mysqld | grep -v grep || echo "No MySQL processes running"
+    echo
+    
+    echo "8. Service Configuration Check:"
+    if [[ -f "$MYSQL_SERVICE_FILE" ]]; then
+        echo "Service file exists: $MYSQL_SERVICE_FILE"
+        echo "Service file contents:"
+        cat "$MYSQL_SERVICE_FILE"
+        echo
+        
+        # Check if executables exist
+        echo "Executable checks:"
+        if [[ -x "/usr/local/mysql/bin/mysqld" ]]; then
+            echo "✓ mysqld executable exists"
+        else
+            echo "✗ mysqld executable missing or not executable"
+        fi
+        
+        if [[ -x "/usr/local/mysql/bin/mysqld_safe" ]]; then
+            echo "✓ mysqld_safe executable exists"
+        else
+            echo "✗ mysqld_safe executable missing or not executable"
+        fi
+    else
+        echo "Service file missing: $MYSQL_SERVICE_FILE"
+    fi
+    echo
+    
+    echo "9. Port Status:"
+    ss -tlnp | grep :3306 || echo "Port 3306 not in use"
+    echo
+    
+    echo "9. Port Status:"
+    ss -tlnp | grep :3306 || echo "Port 3306 not in use"
+    echo
+    
+    echo "10. Disk Space:"
+    df -h /usr/local
+    echo
+    
+    echo "11. Configuration Validation:"
+    if [[ -x "/usr/local/mysql/bin/mysqld" ]]; then
+        /usr/local/mysql/bin/mysqld --defaults-file="$MYSQL_CONFIG_FILE" --validate-config 2>&1 || echo "Configuration validation failed"
+    else
+        echo "mysqld binary not found or not executable"
+    fi
+    
+    echo "=========================================="
+    echo "Diagnostic Report Complete"
+    echo "=========================================="
+}
+
 generate_installation_report() {
     local report_file
     report_file="/tmp/mysql_installation_report_$(date +%Y%m%d_%H%M%S).txt"
@@ -840,4 +989,34 @@ main() {
 }
 
 # Run main function
-main "$@"
+if [[ "${1:-}" == "--diagnose" || "${1:-}" == "-d" ]]; then
+    # Initialize basic variables for diagnosis
+    MYSQL_BASE_DIR="/usr/local/mysql"
+    MYSQL_DATA_DIR="${MYSQL_BASE_DIR}/data"
+    MYSQL_LOG_DIR="${MYSQL_BASE_DIR}/logs"
+    MYSQL_TMP_DIR="${MYSQL_BASE_DIR}/tmp"
+    MYSQL_BINLOG_DIR="${MYSQL_BASE_DIR}/binlog"
+    MYSQL_CONFIG_FILE="/etc/my.cnf"
+    MYSQL_USER="mysql"
+    
+    echo "Running MySQL diagnostic mode..."
+    diagnose_mysql_issues
+elif [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "MySQL Installation Script"
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  -d, --diagnose    Run diagnostic mode to troubleshoot issues"
+    echo "  -h, --help        Show this help message"
+    echo "  (no options)      Run full MySQL installation"
+    echo ""
+    echo "Environment variables:"
+    echo "  MYSQL_ROOT_PASSWORD   Set custom root password (default: Byrszkys.)"
+    echo ""
+    echo "Examples:"
+    echo "  sudo $0                              # Install MySQL"
+    echo "  sudo $0 --diagnose                   # Diagnose installation issues"
+    echo "  sudo MYSQL_ROOT_PASSWORD='mypass' $0 # Install with custom password"
+else
+    main "$@"
+fi
