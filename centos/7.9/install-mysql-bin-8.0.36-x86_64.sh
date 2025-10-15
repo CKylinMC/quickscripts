@@ -486,7 +486,24 @@ download_and_install_mysql() {
         return 1
     fi
     
-    # Set proper ownership
+    # Recreate MySQL data directories (they may have been overwritten)
+    log_info "Creating/recreating MySQL data directories..."
+    local mysql_dirs=(
+        "$MYSQL_DATA_DIR"
+        "$MYSQL_LOG_DIR"
+        "$MYSQL_TMP_DIR"
+        "$MYSQL_BINLOG_DIR"
+    )
+    
+    for dir in "${mysql_dirs[@]}"; do
+        if ! mkdir -p "$dir"; then
+            log_error "Failed to create directory: $dir"
+            return 1
+        fi
+        log_info "Created/verified directory: $dir"
+    done
+    
+    # Set proper ownership for entire MySQL directory
     chown -R "$MYSQL_USER:$MYSQL_GROUP" mysql || {
         log_error "Failed to set ownership for MySQL installation"
         return 1
@@ -541,7 +558,7 @@ long_query_time=2
 log-bin=$MYSQL_BINLOG_DIR/mysql-bin
 binlog_format=ROW
 server-id=1
-expire_logs_days=7
+binlog_expire_logs_seconds=604800  # 7 days in seconds
 
 # Character set and collation
 character-set-server=utf8mb4
