@@ -20,10 +20,12 @@ readonly MYSQL_CONFIG_FILE="/etc/my.cnf"
 readonly MYSQL_SERVICE_FILE="/etc/systemd/system/mysqld.service"
 readonly DOWNLOAD_URL="https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-${MYSQL_VERSION}-linux-glibc2.12-x86_64.tar.xz"
 readonly WORK_DIR="/opt"
-readonly LOG_FILE
-readonly BACKUP_DIR
+
+# Generate unique log and backup directories
 LOG_FILE="/tmp/mysql_install_$(date +%Y%m%d_%H%M%S).log"
 BACKUP_DIR="/tmp/mysql_backup_$(date +%Y%m%d_%H%M%S)"
+readonly LOG_FILE
+readonly BACKUP_DIR
 
 # Script execution control
 set -euo pipefail
@@ -134,10 +136,12 @@ verify_download() {
 
 # Cleanup on exit
 cleanup_on_exit() {
-    log_info "Performing cleanup on exit..."
-    # Restore file descriptors
-    exec 1>&3 2>&4
-    exec 3>&- 4>&-
+    log_info "Performing cleanup on exit..." 2>/dev/null || echo "Performing cleanup on exit..."
+    # Restore file descriptors safely
+    if [[ -t 3 ]] 2>/dev/null; then
+        exec 1>&3 2>&4
+        exec 3>&- 4>&-
+    fi
 }
 
 # Rollback installation
@@ -792,6 +796,9 @@ EOF
 #==============================================================================
 
 main() {
+    # Initialize logging first
+    init_log
+    
     log_info "Starting MySQL installation process..."
     
     # Execute installation steps
