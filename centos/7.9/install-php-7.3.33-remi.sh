@@ -52,6 +52,10 @@ log_success() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] $*" | tee -a "$LOG_FILE"
 }
 
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $*" | tee -a "$LOG_FILE"
+}
+
 # 错误处理
 handle_error() {
     local exit_code=$1
