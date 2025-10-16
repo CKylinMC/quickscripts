@@ -18,6 +18,24 @@ PHP_VER=73          # Remi 仓库版本号
 PHP_RT_VER=7.3.33   # 运行时真正版本
 NGINX_REPO=/etc/yum.repos.d/nginx.repo
 
+# 检查命令行参数
+FORCE_INTERACTIVE=false
+for arg in "$@"; do
+    case $arg in
+        --interactive|-i)
+            FORCE_INTERACTIVE=true
+            shift
+            ;;
+        --help|-h)
+            echo "用法: $0 [选项]"
+            echo "选项:"
+            echo "  -i, --interactive    强制交互模式（适用于 curl | bash）"
+            echo "  -h, --help           显示帮助信息"
+            exit 0
+            ;;
+    esac
+done
+
 mkdir -p "$LOCK_DIR"
 touch "$LOCK_FILE"
 
@@ -414,12 +432,29 @@ if ! done_step "php_backend_conf"; then
     echo "2) PHP-CGI (简单，适合测试环境)"
     echo "3) 两者都配置 (PHP-FPM 作为主要，PHP-CGI 作为备用)"
     
-    # 如果是非交互模式，默认使用 PHP-FPM
-    if [[ -t 0 ]]; then
-        read -p "请选择 (1-3，默认为1): " php_backend_choice
+    # 检查是否为交互模式 - 支持强制交互和多重检查
+    if [[ "$FORCE_INTERACTIVE" == "true" ]] || [[ -t 0 && -t 1 && -z "${BASH_ENV:-}" && -z "${CI:-}" && "${TERM:-}" != "dumb" ]]; then
+        # 交互模式：直接询问用户
+        if [[ "$FORCE_INTERACTIVE" == "true" ]]; then
+            log_info "强制交互模式已启用"
+            # 在管道模式下，需要从 /dev/tty 读取用户输入
+            if [[ ! -t 0 ]]; then
+                read -p "请选择 (1-3，默认为1): " php_backend_choice < /dev/tty
+            else
+                read -p "请选择 (1-3，默认为1): " php_backend_choice
+            fi
+        else
+            read -p "请选择 (1-3，默认为1): " php_backend_choice
+        fi
+        # 如果用户直接按回车，设置默认值
+        php_backend_choice=${php_backend_choice:-1}
+        log_info "用户选择: $php_backend_choice"
     else
+        # 非交互模式：使用默认值
         php_backend_choice=1
-        log_info "非交互模式，默认选择 PHP-FPM"
+        log_info "非交互模式检测到，默认选择 PHP-FPM"
+        log_info "检测条件: stdin=[[ -t 0 ]]: $([[ -t 0 ]] && echo "true" || echo "false"), stdout=[[ -t 1 ]]: $([[ -t 1 ]] && echo "true" || echo "false"), TERM=${TERM:-unset}"
+        log_info "提示: 如需交互模式，请使用: curl xxx | bash -s -- --interactive"
     fi
     
     case "${php_backend_choice:-1}" in
