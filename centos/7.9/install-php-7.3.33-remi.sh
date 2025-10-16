@@ -103,6 +103,248 @@ diagnose_php_fpm() {
     fi
 }
 
+# 配置 PHP-CGI 到 9000 端口
+configure_php_cgi() {
+    log_info "配置 PHP-CGI 到 9000 端口..."
+    
+    # 创建 PHP-CGI 启动脚本
+    cat > /usr/local/bin/php-cgi-server.sh << 'EOF'
+#!/bin/bash
+# PHP-CGI Server Start Script
+# 在 9000 端口启动 PHP-CGI 服务
+
+USER="nginx"
+GROUP="nginx"
+PORT="9000"
+HOST="127.0.0.1"
+CHILDREN=5
+REQUESTS=1000
+
+# 检查用户是否存在
+if ! id "$USER" &>/dev/null; then
+    echo "用户 $USER 不存在，请先创建"
+    exit 1
+fi
+
+# 检查端口是否被占用
+if ss -tlnp | grep ":$PORT" >/dev/null; then
+    echo "端口 $PORT 已被占用"
+    exit 1
+fi
+
+# 启动 PHP-CGI
+echo "启动 PHP-CGI 服务..."
+echo "监听: $HOST:$PORT"
+echo "用户: $USER:$GROUP"
+echo "子进程数: $CHILDREN"
+echo "每个子进程处理请求数: $REQUESTS"
+
+exec /usr/bin/php-cgi \
+    -b $HOST:$PORT \
+    -C $CHILDREN \
+    -R $REQUESTS
+EOF
+
+    chmod +x /usr/local/bin/php-cgi-server.sh
+    log_success "PHP-CGI 启动脚本已创建: /usr/local/bin/php-cgi-server.sh"
+    
+    # 创建 systemd 服务文件
+    cat > /etc/systemd/system/php-cgi.service << 'EOF'
+[Unit]
+Description=PHP CGI Server
+After=network.target
+
+[Service]
+Type=simple
+User=nginx
+Group=nginx
+ExecStart=/usr/local/bin/php-cgi-server.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    log_success "PHP-CGI systemd 服务文件已创建"
+    
+    # 重新加载 systemd
+    systemctl daemon-reload
+    
+    # 启用服务
+    systemctl enable php-cgi
+    log_success "PHP-CGI 服务已启用"
+    
+    return 0
+}
+
+# 测试 PHP-CGI 连接
+test_php_cgi() {
+    log_info "测试 PHP-CGI 连接..."
+    
+    # 等待服务启动
+    sleep 3
+    
+    # 检查端口监听
+    if ss -tlnp | grep :9000 >/dev/null; then
+        log_success "PHP-CGI 正在监听端口 9000"
+        
+        # 简单的连接测试
+        if echo -e "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc -w 5 127.0.0.1 9000 >/dev/null 2>&1; then
+            log_success "PHP-CGI 连接测试成功"
+        else
+            log_warn "PHP-CGI 连接测试失败，但服务可能正常运行"
+        fi
+    else
+        log_error "PHP-CGI 未监听端口 9000"
+        return 1
+    fi
+}
+
+# 仅配置 PHP-FPM
+configure_php_fpm_only() {
+    log_info "配置 PHP-FPM 到 9000 端口..."
+    
+    # 备份原配置
+    if [[ -f /etc/php-fpm.d/www.conf ]]; then
+        cp /etc/php-fpm.d/www.conf /etc/php-fpm.d/www.conf.backup
+    fi
+    
+    # 配置 PHP-FPM 使用 nginx 用户和 9000 端口
+    log_info "更新 PHP-FPM 配置..."
+    sed -i 's/^user = .*/user = nginx/;
+            s/^group = .*/group = nginx/;
+            s/^listen =.*/listen = 127.0.0.1:9000/' /etc/php-fpm.d/www.conf
+    
+    # 检查配置语法
+    log_info "检查 PHP-FPM 配置语法..."
+    if php-fpm -t; then
+        log_success "PHP-FPM 配置语法正确"
+    else
+        log_error "PHP-FPM 配置语法错误"
+        diagnose_php_fpm
+        exit 1
+    fi
+    
+    # 启用并启动服务
+    systemctl enable php-fpm
+    
+    log_info "启动 PHP-FPM 服务..."
+    if systemctl start php-fpm; then
+        log_success "PHP-FPM 启动成功"
+        sleep 2
+        if check_service php-fpm; then
+            log_success "PHP-FPM 配置完成"
+        else
+            log_error "PHP-FPM 启动后状态异常"
+            diagnose_php_fpm
+            exit 1
+        fi
+    else
+        log_error "PHP-FPM 启动失败"
+        diagnose_php_fpm
+        exit 1
+    fi
+}
+
+# 仅配置 PHP-CGI
+configure_php_cgi_only() {
+    log_info "配置 PHP-CGI 到 9000 端口..."
+    
+    # 停止可能运行的 PHP-FPM
+    systemctl stop php-fpm 2>/dev/null || true
+    systemctl disable php-fpm 2>/dev/null || true
+    
+    # 配置 PHP-CGI
+    configure_php_cgi
+    
+    log_info "启动 PHP-CGI 服务..."
+    if systemctl start php-cgi; then
+        log_success "PHP-CGI 启动成功"
+        test_php_cgi
+        log_success "PHP-CGI 配置完成"
+    else
+        log_error "PHP-CGI 启动失败"
+        journalctl -u php-cgi --since "5 minutes ago" --no-pager
+        exit 1
+    fi
+}
+
+# 配置 PHP-CGI 作为备用
+configure_php_cgi_alternative() {
+    log_info "配置 PHP-CGI 作为备用服务..."
+    
+    # 配置 PHP-CGI 到不同端口
+    cat > /usr/local/bin/php-cgi-backup.sh << 'EOF'
+#!/bin/bash
+# PHP-CGI Backup Server Start Script
+# 在 9001 端口启动 PHP-CGI 备用服务
+
+USER="nginx"
+GROUP="nginx"
+PORT="9001"
+HOST="127.0.0.1"
+CHILDREN=3
+REQUESTS=500
+
+# 检查用户是否存在
+if ! id "$USER" &>/dev/null; then
+    echo "用户 $USER 不存在，请先创建"
+    exit 1
+fi
+
+# 检查端口是否被占用
+if ss -tlnp | grep ":$PORT" >/dev/null; then
+    echo "端口 $PORT 已被占用"
+    exit 1
+fi
+
+# 启动 PHP-CGI
+echo "启动 PHP-CGI 备用服务..."
+echo "监听: $HOST:$PORT"
+echo "用户: $USER:$GROUP"
+
+exec /usr/bin/php-cgi \
+    -b $HOST:$PORT \
+    -C $CHILDREN \
+    -R $REQUESTS
+EOF
+
+    chmod +x /usr/local/bin/php-cgi-backup.sh
+    
+    # 创建备用服务
+    cat > /etc/systemd/system/php-cgi-backup.service << 'EOF'
+[Unit]
+Description=PHP CGI Backup Server
+After=network.target
+
+[Service]
+Type=simple
+User=nginx
+Group=nginx
+ExecStart=/usr/local/bin/php-cgi-backup.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable php-cgi-backup
+    
+    log_info "启动 PHP-CGI 备用服务..."
+    if systemctl start php-cgi-backup; then
+        log_success "PHP-CGI 备用服务启动成功 (端口 9001)"
+    else
+        log_warn "PHP-CGI 备用服务启动失败，但主 PHP-FPM 服务正常"
+    fi
+}
+
 ################  1. 卸载旧环境  ################
 if ! done_step "remove_old"; then
     log_info "移除旧版 Nginx / PHP ..."
@@ -149,19 +391,16 @@ if ! done_step "php"; then
     mark "php"
 fi
 
-################  5. 配置 PHP-FPM  ################
-if ! done_step "php_fpm_conf"; then
-    log_info "配置 PHP-FPM ..."
+################  5. 配置 PHP-FPM 或 PHP-CGI  ################
+if ! done_step "php_backend_conf"; then
+    log_info "配置 PHP 后端服务..."
     
     # 检查配置文件是否存在
-    if [[ ! -f /etc/php-fpm.d/www.conf ]]; then
-        log_error "PHP-FPM 配置文件不存在: /etc/php-fpm.d/www.conf"
+    if [[ ! -f /etc/php-fpm.d/www.conf ]] && ! command -v php-cgi >/dev/null; then
+        log_error "PHP-FPM 和 PHP-CGI 都不可用"
         log_info "尝试重新安装 php-fpm..."
         yum reinstall -y php-fpm
     fi
-    
-    # 备份原配置
-    cp /etc/php-fpm.d/www.conf /etc/php-fpm.d/www.conf.backup
     
     # 检查 nginx 用户是否存在，如果不存在则创建
     if ! id nginx &>/dev/null; then
@@ -169,41 +408,41 @@ if ! done_step "php_fpm_conf"; then
         useradd -r -s /sbin/nologin nginx
     fi
     
-    # 配置 PHP-FPM 使用 nginx 用户和 9000 端口
-    log_info "更新 PHP-FPM 配置..."
-    sed -i 's/^user = .*/user = nginx/;
-            s/^group = .*/group = nginx/;
-            s/^listen =.*/listen = 127.0.0.1:9000/' /etc/php-fpm.d/www.conf
+    # 询问用户选择 PHP-FPM 还是 PHP-CGI
+    echo "请选择 PHP 后端服务类型："
+    echo "1) PHP-FPM (推荐，更好的性能和管理)"
+    echo "2) PHP-CGI (简单，适合测试环境)"
+    echo "3) 两者都配置 (PHP-FPM 作为主要，PHP-CGI 作为备用)"
     
-    # 检查配置语法
-    log_info "检查 PHP-FPM 配置语法..."
-    if php-fpm -t; then
-        log_success "PHP-FPM 配置语法正确"
+    # 如果是非交互模式，默认使用 PHP-FPM
+    if [[ -t 0 ]]; then
+        read -p "请选择 (1-3，默认为1): " php_backend_choice
     else
-        log_error "PHP-FPM 配置语法错误"
-        diagnose_php_fpm
-        exit 1
+        php_backend_choice=1
+        log_info "非交互模式，默认选择 PHP-FPM"
     fi
     
-    # 启用并启动服务
-    systemctl enable php-fpm
+    case "${php_backend_choice:-1}" in
+        1)
+            log_info "配置 PHP-FPM..."
+            configure_php_fpm_only
+            ;;
+        2)
+            log_info "配置 PHP-CGI..."
+            configure_php_cgi_only
+            ;;
+        3)
+            log_info "配置 PHP-FPM 和 PHP-CGI..."
+            configure_php_fpm_only
+            configure_php_cgi_alternative
+            ;;
+        *)
+            log_info "无效选择，默认使用 PHP-FPM"
+            configure_php_fpm_only
+            ;;
+    esac
     
-    log_info "启动 PHP-FPM 服务..."
-    if systemctl start php-fpm; then
-        log_success "PHP-FPM 启动成功"
-        sleep 2
-        if check_service php-fpm; then
-            mark "php_fpm_conf"
-        else
-            log_error "PHP-FPM 启动后状态异常"
-            diagnose_php_fpm
-            exit 1
-        fi
-    else
-        log_error "PHP-FPM 启动失败"
-        diagnose_php_fpm
-        exit 1
-    fi
+    mark "php_backend_conf"
 fi
 
 ################  6. 安装 Nginx  ################
