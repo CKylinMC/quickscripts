@@ -1,54 +1,57 @@
 #!/bin/bash
 
-# --- 变量配置 ---
-REMOTE_SCRIPT_URL="https://${SCRIPT_HOST:-run.ckyl.in}/self/setup-ssh.sh" 
-# ----------------
+# --- Configuration with Env Overrides ---
+# Use: REMOTE_SCRIPT_URL="https://my.domain/s.sh" bash gen_install.sh
+REMOTE_HOST=${REMOTE_HOST:-"run.ckyl.in"}
+REMOTE_SCRIPT_URL="https://${REMOTE_HOST}/self/setup-ssh.sh"
 
-# 颜色
 BLUE='\033[0;34m'
+RED='\033[0;31m'
 NC='\033[0m'
 
-PUBKEY_PATH=""
-PROVIDED_KEY=""
+find_local_pubkey() {
+    # Search order: ed25519 -> rsa
+    if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+        cat "$HOME/.ssh/id_ed25519.pub"
+    elif [ -f "$HOME/.ssh/id_rsa.pub" ]; then
+        cat "$HOME/.ssh/id_rsa.pub"
+    else
+        return 1
+    fi
+}
 
-# 参数解析
-while [[ $# -gt 0 ]]; do
-    case $1 in
+PUBKEY_CONTENT=""
+
+# Argument Parsing
+for arg in "$@"; do
+    case $arg in
         --pubkey=*)
-            PUBKEY_PATH="${1#*=}"
-            shift
-            ;;
-        *)
-            shift
+            FILE_PATH="${arg#*=}"
+            if [ -f "$FILE_PATH" ]; then
+                PUBKEY_CONTENT=$(cat "$FILE_PATH")
+            else
+                echo -e "${RED}Error: File $FILE_PATH not found.${NC}"
+                exit 1
+            fi
             ;;
     esac
 done
 
-# 密钥探测逻辑
-if [ -n "$PUBKEY_PATH" ]; then
-    if [ -f "$PUBKEY_PATH" ]; then
-        PROVIDED_KEY=$(cat "$PUBKEY_PATH")
-    else
-        echo "Fatal: Pubkey file $PUBKEY_PATH not exists."
-        exit 1
-    fi
-else
-    # 自动探测默认密钥: 优先 ed25519，然后 rsa
-    if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-        PROVIDED_KEY=$(cat "$HOME/.ssh/id_ed25519.pub")
-    elif [ -f "$HOME/.ssh/id_rsa.pub" ]; then
-        PROVIDED_KEY=$(cat "$HOME/.ssh/id_rsa.pub")
-    else
-        echo "Fatal: Default key (id_ed25519 或 id_rsa) not found，use --pubkey= to specific pubkey file."
+# Auto-detect if not provided
+if [ -z "$PUBKEY_CONTENT" ]; then
+    PUBKEY_CONTENT=$(find_local_pubkey)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Error: No default keys found (id_ed25519 or id_rsa).${NC}"
+        echo "Please use --pubkey=/path/to/key.pub"
         exit 1
     fi
 fi
 
-# 移除可能的换行符并转义单引号以便安全传输
-PROVIDED_KEY=$(echo "$PROVIDED_KEY" | tr -d '\n\r')
+# Clean up key (remove newlines)
+SAFE_KEY=$(echo "$PUBKEY_CONTENT" | tr -d '\n\r')
 
-echo -e "${BLUE}=== Generated command ===${NC}"
+echo -e "${BLUE}=== Generated One-Line Command ===${NC}"
 echo ""
-echo "curl -sSL $REMOTE_SCRIPT_URL | sudo sh -s -- --add-pubkey=\"$PROVIDED_KEY\""
+# Note: Explicitly using 'sudo bash -s' to handle Dash/Bash compatibility
+printf "curl -sSL %s | sudo bash -s -- --add-pubkey=\"%s\"\n" "$REMOTE_SCRIPT_URL" "$SAFE_KEY"
 echo ""
-echo -e "${BLUE}Tip：${NC}Copy and paste to your remote sever, and your server will be config as well."
