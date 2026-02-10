@@ -1,12 +1,11 @@
 #!/bin/sh
 
-# --- Configuration with Env Overrides ---
-# Use: SSH_PORT=2222 bash setup_ssh.sh
+# --- Variables with Env Overrides ---
 SSH_PORT=${SSH_PORT:-29}
 CONFIG_FILE=${CONFIG_FILE:-/etc/ssh/sshd_config}
 OS_TYPE=$(uname -s)
 
-# Color Definitions
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -16,18 +15,17 @@ error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; exit 1; }
 
 # Privilege Check
 if [ "$OS_TYPE" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
-    error "Please run as root or use sudo."
+    error "Must run as root or use sudo."
 fi
 
-# Backup Configuration
-BACKUP_PATH="${CONFIG_FILE}.bak_$(date +%Y%m%d%H%M%S)"
-cp "$CONFIG_FILE" "$BACKUP_PATH" || error "Failed to backup $CONFIG_FILE"
-log "Configuration backed up to $BACKUP_PATH"
+# 1. Update sshd_config
+log "Configuring sshd_config..."
+cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
 
-# Portable Config Update Function
-update_config() {
+update_conf() {
     key="$1"
     value="$2"
+    # Handling sed -i differences safely
     if [ "$OS_TYPE" = "Darwin" ]; then
         sed -i '' "/^#\?${key}.*/d" "$CONFIG_FILE"
     else
@@ -36,67 +34,55 @@ update_config() {
     echo "${key} ${value}" >> "$CONFIG_FILE"
 }
 
-log "Applying SSH configurations (Port: $SSH_PORT)..."
-update_config "Port" "$SSH_PORT"
-update_config "PermitRootLogin" "yes"
-update_config "PubkeyAuthentication" "yes"
-update_config "PasswordAuthentication" "no"
-update_config "ChallengeResponseAuthentication" "no"
+update_conf "Port" "$SSH_PORT"
+update_conf "PermitRootLogin" "yes"
+update_conf "PubkeyAuthentication" "yes"
+update_conf "PasswordAuthentication" "no"
 
-# Handle Public Key
+# 2. Fix Ubuntu 24.04 Socket Activation
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files | grep -q ssh.socket; then
+        log "Detected ssh.socket (Ubuntu 22.10+). Overriding ports..."
+        mkdir -p /etc/systemd/system/ssh.socket.d
+        cat <<EOF > /etc/systemd/system/ssh.socket.d/override.conf
+[Socket]
+ListenStream=
+ListenStream=${SSH_PORT}
+EOF
+        systemctl daemon-reload
+    fi
+fi
+
+# 3. Handle Public Keys
 PUBKEY=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --input-pubkey)
-            printf "${GREEN}[INPUT] Paste your public key:${NC} "
-            read -r PUBKEY
-            shift
-            ;;
-        --add-pubkey=*)
-            PUBKEY="${1#*=}"
-            shift
-            ;;
-        *)
-            shift
-            ;;
+for arg in "$@"; do
+    case "$arg" in
+        --add-pubkey=*) PUBKEY="${arg#*=}" ;;
     esac
 done
 
 if [ -n "$PUBKEY" ]; then
-    # Determine target directory
+    # Cross-platform home directory resolution
     if [ "$OS_TYPE" = "Darwin" ]; then
-        TARGET_DIR="$HOME/.ssh"
+        USER_HOME="$HOME"
     else
-        [ "$(id -u)" -eq 0 ] && TARGET_DIR="/root/.ssh" || TARGET_DIR="$HOME/.ssh"
+        [ "$(id -u)" -eq 0 ] && USER_HOME="/root" || USER_HOME="$HOME"
     fi
-
-    mkdir -p "$TARGET_DIR"
-    chmod 700 "$TARGET_DIR"
     
-    AUTH_FILE="$TARGET_DIR/authorized_keys"
-    # Ensure newline before appending
-    printf "\n%s\n" "$PUBKEY" >> "$AUTH_FILE"
-    chmod 600 "$AUTH_FILE"
-    
-    # Fix ownership on Linux
-    if [ "$OS_TYPE" != "Darwin" ] && [ "$(id -u)" -eq 0 ]; then
-        chown -R root:root "$TARGET_DIR" 2>/dev/null || true
-    fi
-    log "Public key added to $AUTH_FILE"
-else
-    log "No public key provided. Skipping authorized_keys setup."
+    mkdir -p "$USER_HOME/.ssh" && chmod 700 "$USER_HOME/.ssh"
+    printf "\n%s\n" "$PUBKEY" >> "$USER_HOME/.ssh/authorized_keys"
+    chmod 600 "$USER_HOME/.ssh/authorized_keys"
+    log "Public key installed to $USER_HOME/.ssh/authorized_keys"
 fi
 
-# Restart SSH Service
-log "Restarting SSH service..."
+# 4. Restart services
+log "Restarting services..."
 if [ "$OS_TYPE" = "Darwin" ]; then
     sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null
     sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
-elif command -v systemctl >/dev/null 2>&1; then
-    systemctl restart ssh || systemctl restart sshd
 else
-    /etc/init.d/ssh restart || /etc/init.d/sshd restart
+    # Aggressive restart to clear Socket Activation locks
+    systemctl stop ssh.socket 2>/dev/null
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd
+    systemctl start ssh.socket 2>/dev/null
 fi
-
-log "Success! SSH is now running on port $SSH_PORT."
-log "IMPORTANT: Do NOT close this session until you verify access in a new terminal!"
