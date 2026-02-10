@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 变量配置 ---
-REMOTE_SCRIPT_URL="https://${SCRIPT_HOST:-run.ckyl.in}/self/setup_ssh.sh" 
+REMOTE_SCRIPT_URL="https://${SCRIPT_HOST:-run.ckyl.in}/self/setup-ssh.sh" 
 # ----------------
 
 # 颜色
