@@ -523,10 +523,27 @@ check_ssh() {
     fi
     print_info "SSH 端口" "$ssh_port"
 
-    # 密码认证状态
+    # 辅助函数：获取 sshd 最终生效配置值
+    # 优先 sshd -T（处理 Include、多行覆盖、注释），回退 grep 扫描配置文件
+    _get_sshd_val() {
+        local key="$1"
+        local val=""
+        local key_lower
+        key_lower=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+        # 方法1: sshd -T 读取最终生效配置（最可靠）
+        val=$(sshd -T 2>/dev/null | grep "^${key_lower} " | awk '{print $2}')
+        # 方法2: grep 扫描主配置 + .d 子目录，排除注释，取最后一行（后写的覆盖先写的）
+        if [ -z "$val" ]; then
+            val=$(grep -Eh "^[[:space:]]*${key}[[:space:]]" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+                | grep -v '^[[:space:]]*#' | tail -1 | awk '{print $2}')
+        fi
+        echo "$val"
+    }
+
+    # 密码认证 / 密钥认证 / Root 登录（统一用 _get_sshd_val 获取最终值）
     if [ -f /etc/ssh/sshd_config ]; then
         local pass_auth
-        pass_auth=$(grep -E "^PasswordAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+        pass_auth=$(_get_sshd_val "PasswordAuthentication")
         if [ "$pass_auth" = "yes" ]; then
             print_warn "密码认证" "已启用"
         elif [ "$pass_auth" = "no" ]; then
@@ -535,9 +552,8 @@ check_ssh() {
             print_warn "密码认证" "未显式配置（默认可能为 yes）"
         fi
 
-        # 密钥认证状态
         local pubkey_auth
-        pubkey_auth=$(grep -E "^PubkeyAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+        pubkey_auth=$(_get_sshd_val "PubkeyAuthentication")
         if [ "$pubkey_auth" = "yes" ]; then
             print_info "密钥认证" "已启用"
         elif [ "$pubkey_auth" = "no" ]; then
@@ -546,9 +562,8 @@ check_ssh() {
             print_info "密钥认证" "未显式配置（默认通常为 yes）"
         fi
 
-        # PermitRootLogin
         local root_login
-        root_login=$(grep -E "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+        root_login=$(_get_sshd_val "PermitRootLogin")
         if [ -n "$root_login" ]; then
             case "$root_login" in
                 yes) print_warn "Root 登录" "已允许" ;;
@@ -636,15 +651,58 @@ check_web_services() {
 
     # 通用: 检测监听 80/443 的进程
     if [ $web_found -eq 0 ]; then
-        local web_proc
         if command -v ss &> /dev/null; then
-            web_proc=$(ss -tlnp 2>/dev/null | grep -E ":(80|443|8080|8443) " | head -3 | awk '{print $NF}' | xargs)
+            # 从 ss 输出中提取进程名和 PID，去重
+            local web_procs
+            web_procs=$(ss -tlnp 2>/dev/null | grep -E ":(80|443|8080|8443) " | \
+                awk '{print $NF}' | \
+                sed 's/users:((//g; s/))//g; s/),(/\n/g' | \
+                awk -F',' '{print $1","$2}' | \
+                sort -t',' -k1,1 -k2,2 -u)
+            if [ -n "$web_procs" ]; then
+                web_found=1
+                # 按进程名分组显示
+                local current_name=""
+                local pids=""
+                while IFS=',' read -r pname pid_str; do
+                    # 提取纯 PID 数字
+                    local pid_num
+                    pid_num=$(echo "$pid_str" | grep -oE '[0-9]+')
+                    [ -z "$pid_num" ] && continue
+                    if [ "$pname" != "$current_name" ]; then
+                        [ -n "$current_name" ] && print_info "网页进程" "${current_name} (PID: ${pids#, })"
+                        current_name="$pname"
+                        pids=""
+                    fi
+                    # 去重 PID
+                    if ! echo " $pids " | grep -q " $pid_num "; then
+                        pids="$pids, $pid_num"
+                    fi
+                done <<< "$web_procs"
+                [ -n "$current_name" ] && print_info "网页进程" "${current_name} (PID: ${pids#, })"
+            fi
         elif command -v lsof &> /dev/null; then
-            web_proc=$(lsof -iTCP:80 -iTCP:443 -sTCP:LISTEN -nP 2>/dev/null | awk 'NR>1{print $1}' | sort -u | xargs)
-        fi
-        if [ -n "$web_proc" ]; then
-            web_found=1
-            print_info "网页进程" "$web_proc"
+            # macOS / BSD: lsof，提取进程名和 PID
+            local web_procs
+            web_procs=$(lsof -iTCP:80 -iTCP:443 -iTCP:8080 -iTCP:8443 -sTCP:LISTEN -nP 2>/dev/null | \
+                awk 'NR>1{print $1","$2}' | sort -t',' -k1,1 -k2,2 -u)
+            if [ -n "$web_procs" ]; then
+                web_found=1
+                local current_name=""
+                local pids=""
+                while IFS=',' read -r pname pid_num; do
+                    [ -z "$pname" ] && continue
+                    if [ "$pname" != "$current_name" ]; then
+                        [ -n "$current_name" ] && print_info "网页进程" "${current_name} (PID: ${pids#, })"
+                        current_name="$pname"
+                        pids=""
+                    fi
+                    if ! echo " $pids " | grep -q " $pid_num "; then
+                        pids="$pids, $pid_num"
+                    fi
+                done <<< "$web_procs"
+                [ -n "$current_name" ] && print_info "网页进程" "${current_name} (PID: ${pids#, })"
+            fi
         fi
     fi
 
